@@ -21,6 +21,10 @@ const PARTY_API_TIMEOUT_MS = Number.isFinite(configuredPartyApiTimeout)
 // the seat instead of being sent back to the API gateway.
 const processRoutes = new Map();
 const roomRoutes = new Map();
+// Short-lived observations correlate matchmaker reservations with the first
+// WebSocket attempt, making seat-consumption delays visible without logging tokens.
+const reservationObservations = new Map();
+let proxiedWebSocketSequence = 0;
 const PROCESS_ROUTE_TTL_MS = 60 * 60 * 1000;
 
 if (!['http:', 'https:'].includes(PARTY_API_ORIGIN.protocol)) {
@@ -149,7 +153,8 @@ function parsePublicAddress(value) {
 function rememberProcessRoute(reservation, req) {
   const processId = String(reservation?.processId || '').trim();
   const roomId = String(reservation?.roomId || '').trim();
-  const target = parsePublicAddress(reservation?.publicAddress) || parsePublicAddress(PARTY_API_ORIGIN.origin);
+  const advertisedAddress = parsePublicAddress(reservation?.publicAddress);
+  const target = advertisedAddress || parsePublicAddress(PARTY_API_ORIGIN.origin);
   // Colyseus process IDs are URL path segments. Permit dots/colons as well as
   // the common UUID / worker-id characters, but never slashes or dot segments.
   if (!processId || !target || processId.length > 200 || processId === '.' || processId === '..' || !/^[A-Za-z0-9_.:-]+$/.test(processId)) {
@@ -165,7 +170,7 @@ function rememberProcessRoute(reservation, req) {
   }
   const route = {
     ...target,
-    source: reservation?.publicAddress ? 'matchmaker-publicAddress' : 'api-origin-fallback',
+    source: advertisedAddress ? 'matchmaker-publicAddress' : 'api-origin-fallback',
     expiresAt: now + PROCESS_ROUTE_TTL_MS,
   };
   processRoutes.set(processId, route);
@@ -192,6 +197,97 @@ async function sendGameIndex(req, res, next) {
   } catch (error) {
     next(error);
   }
+}
+
+function reservationKey(processId, roomId) {
+  return `${String(processId || '')}:${String(roomId || '')}`;
+}
+
+function rememberReservationObservation(body) {
+  const processId = String(body?.processId || '').trim();
+  const roomId = String(body?.roomId || '').trim();
+  if (!processId || !roomId) return;
+  const key = reservationKey(processId, roomId);
+  const now = Date.now();
+  const entries = (reservationObservations.get(key) || []).filter((entry) => now - entry.at < 10 * 60 * 1000);
+  entries.push({
+    at: now,
+    publicAddressPresent: Boolean(String(body?.publicAddress || '').trim()),
+    sessionIdPresent: Boolean(String(body?.sessionId || '').trim()),
+    name: String(body?.name || '').slice(0, 64),
+  });
+  reservationObservations.set(key, entries.slice(-12));
+}
+
+function takeReservationObservation(processId, roomId) {
+  const key = reservationKey(processId, roomId);
+  const entries = reservationObservations.get(key);
+  if (!entries?.length) return null;
+  const observation = entries.shift();
+  if (entries.length) reservationObservations.set(key, entries);
+  else reservationObservations.delete(key);
+  return observation;
+}
+
+// Passive WebSocket frame observer. It never changes or consumes the bytes
+// flowing through the proxy; it only reports control-frame close codes/reasons
+// and the first few data-frame sizes (never their contents or auth tokens).
+function observeWebSocketFrames(stream, direction, context) {
+  let buffered = Buffer.alloc(0);
+  let dataFramesLogged = 0;
+  stream.on('data', (chunk) => {
+    buffered = buffered.length ? Buffer.concat([buffered, chunk]) : Buffer.from(chunk);
+    let consumed = 0;
+    while (buffered.length - consumed >= 2) {
+      const first = buffered[consumed];
+      const second = buffered[consumed + 1];
+      const opcode = first & 0x0f;
+      const masked = (second & 0x80) !== 0;
+      let payloadLength = second & 0x7f;
+      let headerLength = 2;
+      if (payloadLength === 126) {
+        if (buffered.length - consumed < 4) break;
+        payloadLength = buffered.readUInt16BE(consumed + 2);
+        headerLength = 4;
+      } else if (payloadLength === 127) {
+        if (buffered.length - consumed < 10) break;
+        const extended = buffered.readBigUInt64BE(consumed + 2);
+        if (extended > BigInt(8 * 1024 * 1024)) {
+          console.warn(`[party-api] WS ${context} ${direction}: skipped oversized frame (${extended.toString()} bytes)`);
+          buffered = Buffer.alloc(0);
+          return;
+        }
+        payloadLength = Number(extended);
+        headerLength = 10;
+      }
+      const maskLength = masked ? 4 : 0;
+      const frameLength = headerLength + maskLength + payloadLength;
+      if (buffered.length - consumed < frameLength) break;
+      const payloadStart = consumed + headerLength + maskLength;
+
+      if (opcode === 0x8) {
+        let payload = buffered.subarray(payloadStart, payloadStart + payloadLength);
+        if (masked && payloadLength) {
+          payload = Buffer.from(payload);
+          const maskStart = consumed + headerLength;
+          for (let index = 0; index < payload.length; index += 1) {
+            payload[index] ^= buffered[maskStart + (index % 4)];
+          }
+        }
+        const closeCode = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+        const closeReason = payload.length > 2
+          ? payload.subarray(2).toString('utf8').replace(/[\r\n\t]+/g, ' ').slice(0, 240)
+          : '';
+        console.log(`[party-api] WS ${context} ${direction}: CLOSE code=${closeCode} reason=${JSON.stringify(closeReason)}`);
+      } else if ((opcode === 0x1 || opcode === 0x2) && dataFramesLogged < 5) {
+        dataFramesLogged += 1;
+        console.log(`[party-api] WS ${context} ${direction}: data frame opcode=${opcode} bytes=${payloadLength}`);
+      }
+      consumed += frameLength;
+    }
+    if (consumed) buffered = buffered.subarray(consumed);
+    if (buffered.length > 8 * 1024 * 1024) buffered = Buffer.alloc(0);
+  });
 }
 
 function proxyHttpToPartyApi(req, res) {
@@ -246,7 +342,9 @@ function proxyHttpToPartyApi(req, res) {
         return;
       }
 
+      const originalPublicAddress = String(body?.publicAddress || '').trim();
       const mapped = rememberProcessRoute(body, req);
+      rememberReservationObservation({ ...body, publicAddress: originalPublicAddress });
       const responseBody = Buffer.from(JSON.stringify(body));
       const responseHeaders = { ...upstreamResponse.headers };
       delete responseHeaders.connection;
@@ -259,7 +357,8 @@ function proxyHttpToPartyApi(req, res) {
       res.end(responseBody);
 
       if (body?.processId) {
-        console.log(`[party-api] Matchmake ${body.processId}: ${mapped ? 'worker route saved through Render' : 'no public worker address; using API fallback'}`);
+        const addressState = originalPublicAddress ? 'matchmaker publicAddress supplied' : 'publicAddress absent; API-origin fallback';
+        console.log(`[party-api] Matchmake reservation: process=${body.processId} room=${body.roomId || '(missing)'} type=${body.name || '(unknown)'} sessionIdPresent=${Boolean(body.sessionId)} route=${addressState} processRouteRecorded=${mapped}`);
       }
     });
     upstreamResponse.on('error', (error) => {
@@ -300,6 +399,10 @@ function proxyWebSocketToPartyApi(req, socket, head) {
     if (route && route.expiresAt <= Date.now()) roomRoutes.delete(roomId);
   }
   const activeRoute = route && route.expiresAt > Date.now() ? route : null;
+  const connectionId = ++proxiedWebSocketSequence;
+  const connectedAt = Date.now();
+  const reservationObservation = takeReservationObservation(processId, roomId);
+  const reservationAgeMs = reservationObservation ? connectedAt - reservationObservation.at : null;
   const upstreamBase = activeRoute
     ? `${activeRoute.protocol}//${activeRoute.hostname}:${activeRoute.port}`
     : PARTY_API_ORIGIN.origin;
@@ -308,7 +411,8 @@ function proxyWebSocketToPartyApi(req, socket, head) {
     : req.url;
   const upstreamUrl = new URL(routedPath, upstreamBase);
   const transport = upstreamUrl.protocol === 'https:' ? https : http;
-  console.log(`[party-api] Room WebSocket process=${processId || '(missing)'} room=${roomId || '(missing)'} route=${activeRoute ? `${upstreamUrl.host} (${routeSource}; ${activeRoute.source})` : `${upstreamUrl.host} (API fallback)`}`);
+  const wsContext = `#${connectionId} process=${processId || '(missing)'} room=${roomId || '(missing)'}`;
+  console.log(`[party-api] Room WebSocket ${wsContext} route=${activeRoute ? `${upstreamUrl.host} (${routeSource}; ${activeRoute.source})` : `${upstreamUrl.host} (API fallback)`} reservationAgeMs=${reservationAgeMs === null ? 'unknown' : reservationAgeMs} publicAddressPresent=${reservationObservation ? reservationObservation.publicAddressPresent : 'unknown'} sessionIdPresent=${reservationObservation ? reservationObservation.sessionIdPresent : 'unknown'}`);
   const headers = { ...req.headers, host: upstreamUrl.host };
   // Hop-by-hop headers are regenerated by the upstream client.
   headers.connection = 'Upgrade';
@@ -327,7 +431,15 @@ function proxyWebSocketToPartyApi(req, socket, head) {
   upstreamRequest.on('upgrade', (upstreamResponse, upstreamSocket, upstreamHead) => {
     settled = true;
     upstreamRequest.setTimeout(0);
-    console.log(`[party-api] WebSocket upgrade accepted process=${processId} room=${roomId} status=${upstreamResponse.statusCode || 101}`);
+    console.log(`[party-api] WebSocket upgrade accepted ${wsContext} status=${upstreamResponse.statusCode || 101} elapsedMs=${Date.now() - connectedAt}`);
+    observeWebSocketFrames(socket, 'client->upstream', wsContext);
+    observeWebSocketFrames(upstreamSocket, 'upstream->client', wsContext);
+    upstreamSocket.on('end', () => console.log(`[party-api] WS ${wsContext}: upstream ended stream after ${Date.now() - connectedAt}ms`));
+    upstreamSocket.on('close', (hadError) => console.log(`[party-api] WS ${wsContext}: upstream socket closed after ${Date.now() - connectedAt}ms hadError=${Boolean(hadError)}`));
+    upstreamSocket.on('error', (error) => console.warn(`[party-api] WS ${wsContext}: upstream socket error ${error.message}`));
+    socket.on('end', () => console.log(`[party-api] WS ${wsContext}: client ended stream after ${Date.now() - connectedAt}ms`));
+    socket.on('close', (hadError) => console.log(`[party-api] WS ${wsContext}: client socket closed after ${Date.now() - connectedAt}ms hadError=${Boolean(hadError)}`));
+    socket.on('error', (error) => console.warn(`[party-api] WS ${wsContext}: client socket error ${error.message}`));
     const statusLine = `HTTP/1.1 ${upstreamResponse.statusCode || 101} ${upstreamResponse.statusMessage || 'Switching Protocols'}\r\n`;
     const responseHeaders = Object.entries(upstreamResponse.headers)
       .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(', ') : value}`)
@@ -348,7 +460,7 @@ function proxyWebSocketToPartyApi(req, socket, head) {
     const responseHeaders = Object.entries(upstreamResponse.headers)
       .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(', ') : value}`)
       .join('\r\n');
-    console.warn(`[party-api] WebSocket upgrade rejected process=${processId} room=${roomId} status=${upstreamResponse.statusCode || 502} target=${upstreamUrl.host}${upstreamUrl.pathname}`);
+    console.warn(`[party-api] WebSocket upgrade rejected ${wsContext} status=${upstreamResponse.statusCode || 502} target=${upstreamUrl.host}${upstreamUrl.pathname} elapsedMs=${Date.now() - connectedAt}`);
     const rejectedBody = [];
     upstreamResponse.on('data', (chunk) => {
       if (Buffer.concat(rejectedBody).length < 2048) rejectedBody.push(Buffer.from(chunk));
