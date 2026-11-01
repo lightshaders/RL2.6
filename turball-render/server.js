@@ -15,6 +15,13 @@ const PARTY_API_TIMEOUT_MS = Number.isFinite(configuredPartyApiTimeout)
   ? Math.min(300000, Math.max(20000, configuredPartyApiTimeout))
   : 120000;
 
+// Colyseus may allocate rooms on a worker whose publicAddress differs from
+// the general matchmaking API host. Keep that worker mapping so the browser's
+// subsequent /<processId>/<roomId> WebSocket reaches the process that reserved
+// the seat instead of being sent back to the API gateway.
+const processRoutes = new Map();
+const PROCESS_ROUTE_TTL_MS = 60 * 60 * 1000;
+
 if (!['http:', 'https:'].includes(PARTY_API_ORIGIN.protocol)) {
   throw new Error('TURBALL_API_ORIGIN must use http:// or https://');
 }
@@ -115,6 +122,49 @@ function getPublicOrigin(req) {
   return `${protocol}://${req.get('host')}`;
 }
 
+function parsePublicAddress(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  try {
+    let parsed;
+    if (/^wss:\/\//i.test(raw)) parsed = new URL(raw.replace(/^wss:/i, 'https:'));
+    else if (/^ws:\/\//i.test(raw)) parsed = new URL(raw.replace(/^ws:/i, 'http:'));
+    else if (/^https?:\/\//i.test(raw)) parsed = new URL(raw);
+    else parsed = new URL(`https://${raw}`);
+
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) return null;
+    return {
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      pathnamePrefix: parsed.pathname && parsed.pathname !== '/' ? parsed.pathname.replace(/\/$/, '') : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function rememberProcessRoute(reservation, req) {
+  const processId = String(reservation?.processId || '').trim();
+  const target = parsePublicAddress(reservation?.publicAddress);
+  if (!processId || !target || processId.length > 160 || !/^[A-Za-z0-9_-]+$/.test(processId)) {
+    return false;
+  }
+
+  const now = Date.now();
+  for (const [id, route] of processRoutes.entries()) {
+    if (route.expiresAt <= now) processRoutes.delete(id);
+  }
+  processRoutes.set(processId, { ...target, expiresAt: now + PROCESS_ROUTE_TTL_MS });
+
+  // Colyseus' browser SDK constructs its room socket from publicAddress.
+  // Rewrite only that field to this Render host; the upgrade handler below
+  // uses processId to forward the connection to the original worker address.
+  reservation.publicAddress = new URL(getPublicOrigin(req)).host;
+  return true;
+}
+
 async function sendGameIndex(req, res, next) {
   try {
     let html = await fs.promises.readFile(INDEX_FILE, 'utf8');
@@ -135,7 +185,7 @@ async function sendGameIndex(req, res, next) {
 function proxyHttpToPartyApi(req, res) {
   const upstreamUrl = new URL(req.originalUrl, PARTY_API_ORIGIN);
   const transport = upstreamUrl.protocol === 'https:' ? https : http;
-  const headers = { ...req.headers, host: upstreamUrl.host };
+  const headers = { ...req.headers, host: upstreamUrl.host, 'accept-encoding': 'identity' };
   delete headers.connection;
   delete headers['proxy-connection'];
   delete headers['transfer-encoding'];
@@ -152,12 +202,59 @@ function proxyHttpToPartyApi(req, res) {
     path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
     headers,
   }, (upstreamResponse) => {
-    const responseHeaders = { ...upstreamResponse.headers };
-    delete responseHeaders.connection;
-    delete responseHeaders['keep-alive'];
-    delete responseHeaders.upgrade;
-    res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
-    upstreamResponse.pipe(res);
+    const isMatchmakeResponse = upstreamUrl.pathname.startsWith('/matchmake/')
+      && (upstreamResponse.statusCode || 500) >= 200
+      && (upstreamResponse.statusCode || 500) < 300
+      && String(upstreamResponse.headers['content-type'] || '').includes('application/json');
+
+    if (!isMatchmakeResponse) {
+      const responseHeaders = { ...upstreamResponse.headers };
+      delete responseHeaders.connection;
+      delete responseHeaders['keep-alive'];
+      delete responseHeaders.upgrade;
+      res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
+      upstreamResponse.pipe(res);
+      return;
+    }
+
+    const chunks = [];
+    upstreamResponse.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    upstreamResponse.on('end', () => {
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      let body;
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        const responseHeaders = { ...upstreamResponse.headers };
+        delete responseHeaders.connection;
+        delete responseHeaders['keep-alive'];
+        delete responseHeaders.upgrade;
+        res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
+        res.end(rawBody);
+        return;
+      }
+
+      const mapped = rememberProcessRoute(body, req);
+      const responseBody = Buffer.from(JSON.stringify(body));
+      const responseHeaders = { ...upstreamResponse.headers };
+      delete responseHeaders.connection;
+      delete responseHeaders['keep-alive'];
+      delete responseHeaders.upgrade;
+      delete responseHeaders['content-encoding'];
+      delete responseHeaders['transfer-encoding'];
+      responseHeaders['content-length'] = String(responseBody.length);
+      res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
+      res.end(responseBody);
+
+      if (body?.processId) {
+        console.log(`[party-api] Matchmake ${body.processId}: ${mapped ? 'worker route saved through Render' : 'no public worker address; using API fallback'}`);
+      }
+    });
+    upstreamResponse.on('error', (error) => {
+      console.error('[party-api] Matchmake response read error:', error.message);
+      if (!res.headersSent) res.status(502).end('Matchmaking response failed.');
+      else res.destroy(error);
+    });
   });
 
   upstreamRequest.setTimeout(PARTY_API_TIMEOUT_MS, () => {
@@ -178,8 +275,22 @@ function proxyHttpToPartyApi(req, res) {
 }
 
 function proxyWebSocketToPartyApi(req, socket, head) {
-  const upstreamUrl = new URL(req.url, PARTY_API_ORIGIN);
+  const requestUrl = new URL(req.url, 'http://render.local');
+  const processId = requestUrl.pathname.split('/').filter(Boolean)[0] || '';
+  const route = processRoutes.get(processId);
+  if (route && route.expiresAt <= Date.now()) processRoutes.delete(processId);
+  const activeRoute = route && route.expiresAt > Date.now() ? route : null;
+  const upstreamBase = activeRoute
+    ? `${activeRoute.protocol}//${activeRoute.hostname}:${activeRoute.port}`
+    : PARTY_API_ORIGIN.origin;
+  const routedPath = activeRoute?.pathnamePrefix
+    ? `${activeRoute.pathnamePrefix}${req.url.startsWith('/') ? req.url : `/${req.url}`}`
+    : req.url;
+  const upstreamUrl = new URL(routedPath, upstreamBase);
   const transport = upstreamUrl.protocol === 'https:' ? https : http;
+  if (processId) {
+    console.log(`[party-api] Room WebSocket ${processId}: ${activeRoute ? `${upstreamUrl.host} (worker)` : `${upstreamUrl.host} (API fallback)`}`);
+  }
   const headers = { ...req.headers, host: upstreamUrl.host };
   // Hop-by-hop headers are regenerated by the upstream client.
   headers.connection = 'Upgrade';
@@ -363,7 +474,7 @@ app.use((req, res, next) => {
 });
 
 app.use('/health', (req, res) => {
-  res.json({ ok: true, rooms: rooms.size, partyCodes: partyCodes.size, uptime: process.uptime(), partyApi: PARTY_API_ORIGIN.origin });
+  res.json({ ok: true, rooms: rooms.size, partyCodes: partyCodes.size, workerRoutes: processRoutes.size, uptime: process.uptime(), partyApi: PARTY_API_ORIGIN.origin });
 });
 
 // The standalone lobby endpoints are retained for the separate /multiplayer page.
