@@ -9,6 +9,11 @@ const PORT = Number(process.env.PORT || 3000);
 const STATIC_ROOT = path.resolve(__dirname, '../turball_extracted');
 const INDEX_FILE = path.join(STATIC_ROOT, 'index.html');
 const PARTY_API_ORIGIN = new URL(process.env.TURBALL_API_ORIGIN || 'https://api.turball.io');
+// Allow slow matchmaker and seat-join handshakes more time through the Render proxy.
+const configuredPartyApiTimeout = Number(process.env.TURBALL_API_TIMEOUT_MS || 120000);
+const PARTY_API_TIMEOUT_MS = Number.isFinite(configuredPartyApiTimeout)
+  ? Math.min(300000, Math.max(20000, configuredPartyApiTimeout))
+  : 120000;
 
 if (!['http:', 'https:'].includes(PARTY_API_ORIGIN.protocol)) {
   throw new Error('TURBALL_API_ORIGIN must use http:// or https://');
@@ -155,7 +160,7 @@ function proxyHttpToPartyApi(req, res) {
     upstreamResponse.pipe(res);
   });
 
-  upstreamRequest.setTimeout(20000, () => {
+  upstreamRequest.setTimeout(PARTY_API_TIMEOUT_MS, () => {
     upstreamRequest.destroy(new Error('Party API request timed out'));
   });
   upstreamRequest.on('error', (error) => {
@@ -223,7 +228,7 @@ function proxyWebSocketToPartyApi(req, socket, head) {
       socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\nParty service unavailable');
     }
   });
-  upstreamRequest.setTimeout(20000, () => upstreamRequest.destroy(new Error('Party WebSocket timed out')));
+  upstreamRequest.setTimeout(PARTY_API_TIMEOUT_MS, () => upstreamRequest.destroy(new Error('Party WebSocket timed out')));
   upstreamRequest.end();
 }
 
